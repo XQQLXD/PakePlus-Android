@@ -4,14 +4,17 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -562,7 +565,7 @@ class MainActivity : AppCompatActivity() {
             (context as? MainActivity)?.runOnUiThread {
                 try {
                     val bytes = Base64.decode(base64Data, Base64.DEFAULT)
-                    saveDecodedDownload(bytes, mimeType, fileName)
+                    saveDecodedOutput(bytes, mimeType, fileName)
                 } catch (e: Exception) {
                     Log.e("BlobDownload", "save error", e)
                     showTopToast(context, "保存失败: ${e.message}", Toast.LENGTH_LONG)
@@ -590,7 +593,78 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 将解码后的文件写入公共 Download 目录（与 JsBridge / data: 下载共用） */
+        private fun saveDecodedOutput(bytes: ByteArray, mimeType: String?, fileName: String?) {
+        if (GallerySaveDecider.shouldSaveToGallery(mimeType, fileName)) {
+            saveImageToGallery(bytes, mimeType, fileName)
+            return
+        }
+
+        saveDecodedDownload(bytes, mimeType, fileName)
+    }
+
+    private fun resolveSafeFileName(mimeType: String?, fileName: String?, defaultPrefix: String): String {
+        if (!fileName.isNullOrBlank()) {
+            return fileName
+        }
+
+        if (!mimeType.isNullOrBlank()) {
+            val ext = MimeTypeMap.getSingleton()
+                .getExtensionFromMimeType(mimeType) ?: "bin"
+            return "${defaultPrefix}_${System.currentTimeMillis()}.${ext}"
+        }
+
+        return "${defaultPrefix}_${System.currentTimeMillis()}.bin"
+    }
+
+    private fun saveImageToGallery(bytes: ByteArray, mimeType: String?, fileName: String?) {
+        val safeName = resolveSafeFileName(mimeType, fileName, "image")
+        val effectiveMimeType = mimeType?.takeIf { it.isNotBlank() } ?: "image/png"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, safeName)
+                put(MediaStore.Images.Media.MIME_TYPE, effectiveMimeType)
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/PakePlus")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("无法创建相册文件")
+
+            contentResolver.openOutputStream(uri)?.use { output ->
+                output.write(bytes)
+                output.flush()
+            } ?: throw IllegalStateException("无法写入相册文件")
+
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            contentResolver.update(uri, values, null, null)
+
+            showTopToast(this, "已保存到相册: ${safeName}", Toast.LENGTH_LONG)
+            Log.d("BlobDownload", "Image saved to gallery: ${uri}")
+            return
+        }
+
+        val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+        val targetDir = File(picturesDir, "PakePlus")
+        if (!targetDir.exists()) {
+            targetDir.mkdirs()
+        }
+
+        val outFile = File(targetDir, safeName)
+        FileOutputStream(outFile).use { it.write(bytes) }
+        MediaScannerConnection.scanFile(
+            this,
+            arrayOf(outFile.absolutePath),
+            arrayOf(effectiveMimeType),
+            null
+        )
+
+        showTopToast(this, "已保存到相册: ${outFile.name}", Toast.LENGTH_LONG)
+        Log.d("BlobDownload", "Image saved to gallery file: ${outFile.absolutePath}")
+    }
+
+    /** 将非图片文件写入公共 Download 目录（与 JsBridge / data: 下载共用） */
     private fun saveDecodedDownload(bytes: ByteArray, mimeType: String?, fileName: String?) {
         val downloadsDir =
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -598,16 +672,7 @@ class MainActivity : AppCompatActivity() {
             downloadsDir.mkdirs()
         }
 
-        val safeName = when {
-            !fileName.isNullOrBlank() -> fileName
-            !mimeType.isNullOrBlank() -> {
-                val ext = MimeTypeMap.getSingleton()
-                    .getExtensionFromMimeType(mimeType) ?: "bin"
-                "download_${System.currentTimeMillis()}.$ext"
-            }
-
-            else -> "download_${System.currentTimeMillis()}.bin"
-        }
+        val safeName = resolveSafeFileName(mimeType, fileName, "download")
 
         val outFile = File(downloadsDir, safeName)
         FileOutputStream(outFile).use { it.write(bytes) }
@@ -616,7 +681,7 @@ class MainActivity : AppCompatActivity() {
         Log.d("BlobDownload", "File saved: ${outFile.absolutePath}")
     }
 
-    /**
+/**
      * Canvas 等生成的 data:/blob: 链接不能走 DownloadManager。
      * @return true 表示已处理或已主动放弃（切勿再 enqueue）
      */
@@ -663,7 +728,7 @@ class MainActivity : AppCompatActivity() {
                     .toByteArray(StandardCharsets.UTF_8)
             }
             val name = URLUtil.guessFileName(dataUrl, contentDisposition, effectiveMime)
-            saveDecodedDownload(bytes, effectiveMime, name)
+            saveDecodedOutput(bytes, effectiveMime, name)
             true
         } catch (e: Exception) {
             Log.e("WebViewDownload", "data URL save failed", e)
